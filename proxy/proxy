@@ -53,11 +53,15 @@ def handle_client(client_socket, log_file, fake_ip, server_ip):
         # Receive the response from the server and forward it to the client
         response = b''
         while True:
-            data = server_socket.recv(4096)
-            if not data:
+            try:
+                data = server_socket.recv(4096)
+                if not data:
+                    break
+                response += data
+                client_socket.sendall(data)
+            except socket.error as e:
+                print(f"Error forwarding data to client: {e}")
                 break
-            response += data
-            client_socket.sendall(data)
 
         end_time = time.time()
         duration = end_time - start_time
