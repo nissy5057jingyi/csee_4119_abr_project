@@ -1,0 +1,108 @@
+#!/usr/bin/env python3.10
+
+import sys
+import socket
+import threading
+import time
+from datetime import datetime
+
+def log_activity(log_file, duration, server_ip, chunk_path, chunk_size):
+    current_time = int(time.time())  # Current time in seconds since epoch
+    log_entry = f"{current_time} {duration:.6f} {server_ip} {chunk_path} {chunk_size}\n"
+    
+    # Write the log entry to the log file
+    with open(log_file, 'a') as log:
+        log.write(log_entry)
+        log.flush()  # Ensure log is written immediately
+
+def handle_client(client_socket, log_file, fake_ip, server_ip):
+    print(f"Handling client connection: {client_socket}")  # Debug print
+
+    try:
+        request = client_socket.recv(4096)
+        if not request:
+            print("Empty request received, closing connection.")  # Debug: Empty request
+            client_socket.close()
+            return
+
+        # Debug: Show the full HTTP request received
+        print(f"Full HTTP request: {request.decode()}")
+
+        # Parse the HTTP GET request to extract the full chunk path
+        request_line = request.decode().split('\n')[0]  # First line of the HTTP request
+        print(f"Request line: {request_line}")  # Debug: Show the request line
+
+        # Ensure that the request line has enough parts to extract the chunk path
+        if len(request_line.split(' ')) > 1:
+            chunk_path = request_line.split(' ')[1]  # Extract the full chunk path
+            if chunk_path == "/":
+                chunk_path = "/index"  # Default for root request
+        else:
+            chunk_path = "(empty)"  # Handle cases where the path is missing
+        print(f"Received request for chunk path: {chunk_path}")  # Debug: Show requested chunk
+
+        # Create a socket to connect to the server
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.bind((fake_ip, 0))  # Bind to fake IP, port 0 for any available port
+        server_socket.connect((server_ip, 80))
+
+        # Send the request to the server
+        start_time = time.time()
+        server_socket.sendall(request)
+
+        # Receive the response from the server and forward it to the client
+        response = b''
+        while True:
+            data = server_socket.recv(4096)
+            if not data:
+                break
+            response += data
+            client_socket.sendall(data)
+
+        end_time = time.time()
+        duration = end_time - start_time
+
+        # Extract chunk size (excluding headers)
+        header_end = response.find(b'\r\n\r\n')
+        if header_end != -1:
+            body = response[header_end+4:]
+            chunk_size = len(body)
+        else:
+            chunk_size = len(response)
+
+        # Log the activity with the full chunk path
+        log_activity(log_file, duration, server_ip, chunk_path, chunk_size)
+
+        # Close sockets
+        server_socket.close()
+        client_socket.close()
+
+    except Exception as e:
+        print(f"Error handling client: {e}")
+        client_socket.close()
+
+
+def start_proxy(log_file, listen_port, fake_ip, server_ip):
+    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    proxy_socket.bind(('', listen_port))  # Bind to all interfaces on the specified port
+    proxy_socket.listen(100)  # Listen for up to 100 connections
+    print(f"Proxy listening on port {listen_port}...")
+
+    while True:
+        client_socket, addr = proxy_socket.accept()  # Unpack the client socket and address
+        print(f"Accepted connection from {addr}")  # Debug: Show client IP
+        client_thread = threading.Thread(target=handle_client, args=(client_socket, log_file, fake_ip, server_ip))
+        client_thread.start()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 5:
+        print("Usage: ./proxy <log> <listen-port> <fake-ip> <server-ip>")
+        sys.exit(1)
+
+    log_file = sys.argv[1]
+    listen_port = int(sys.argv[2])  # Port should be an integer
+    fake_ip = sys.argv[3]  # IP addresses should remain as strings
+    server_ip = sys.argv[4]  # No need to convert the IP to int
+    
+    start_proxy(log_file, listen_port, fake_ip, server_ip)
