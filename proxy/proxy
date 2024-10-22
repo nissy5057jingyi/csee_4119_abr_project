@@ -4,100 +4,121 @@ import sys
 import socket
 import threading
 import time
-from datetime import datetime
+import re
 
-def log_activity(log_file, duration, server_ip, chunk_path, chunk_size):
-    current_time = int(time.time())  # Current time in seconds since epoch
-    log_entry = f"{current_time} {duration:.6f} {server_ip} {chunk_path} {chunk_size}\n"
+def log_chunk(log_file, duration, server_ip, chunk_path, chunk_size):
+    """Log chunk information in the required format"""
+    current_time = int(time.time())
+    log_entry = f"{current_time} {duration:.6f} {server_ip} {chunk_path} {chunk_size}"
     
-    # Write the log entry to the log file
-    with open(log_file, 'a') as log:
-        log.write(log_entry)
-        log.flush()  # Ensure log is written immediately
+    with open(log_file, "a") as f:
+        f.write(log_entry + "\n")
+        f.flush()  # Ensure immediate write to disk
+
+def get_chunk_size(response):
+    """Extract chunk size from HTTP response (excluding headers)"""
+    try:
+        # Find the end of headers marked by \r\n\r\n
+        header_end = response.find(b'\r\n\r\n')
+        if header_end != -1:
+            # Return length of content after headers
+            return len(response[header_end + 4:])
+        return len(response)  # Fallback if no headers found
+    except Exception as e:
+        print(f"Error calculating chunk size: {e}")
+        return 0
+
+def get_chunk_path(request):
+    """Extract the chunk path from HTTP GET request"""
+    try:
+        # Split the request into lines and get the first line
+        request_line = request.decode().split('\n')[0]
+        # Extract path from GET request line
+        match = re.match(r'GET (.*?) HTTP', request_line)
+        if match:
+            path = match.group(1)
+            return path if path != "/" else "/index"
+        return "/index"
+    except Exception as e:
+        print(f"Error extracting chunk path: {e}")
+        return "/error"
 
 def handle_client(client_socket, log_file, fake_ip, server_ip):
-    print(f"Handling client connection: {client_socket}")  # Debug print
-
+    """Handle individual client connections"""
     try:
+        # Receive client request
         request = client_socket.recv(4096)
         if not request:
-            print("Empty request received, closing connection.")  # Debug: Empty request
             client_socket.close()
             return
 
-        # Debug: Show the full HTTP request received
-        print(f"Full HTTP request: {request.decode()}")
+        # Extract chunk path from request
+        chunk_path = get_chunk_path(request)
 
-        # Parse the HTTP GET request to extract the full chunk path
-        request_line = request.decode().split('\n')[0]  # First line of the HTTP request
-        print(f"Request line: {request_line}")  # Debug: Show the request line
-
-        # Ensure that the request line has enough parts to extract the chunk path
-        if len(request_line.split(' ')) > 1:
-            chunk_path = request_line.split(' ')[1]  # Extract the full chunk path
-            if chunk_path == "/":
-                chunk_path = "/index"  # Default for root request
-        else:
-            chunk_path = "(empty)"  # Handle cases where the path is missing
-        print(f"Received request for chunk path: {chunk_path}")  # Debug: Show requested chunk
-
-        # Create a socket to connect to the server
+        # Create server connection
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((fake_ip, 0))  # Bind to fake IP, port 0 for any available port
+        server_socket.bind((fake_ip, 0))  # Bind to fake IP
         server_socket.connect((server_ip, 80))
 
-        # Send the request to the server
+        # Time the request
         start_time = time.time()
+
+        # Forward request to server
         server_socket.sendall(request)
 
-        # Receive the response from the server and forward it to the client
+        # Receive and forward response
         response = b''
         while True:
-            try:
-                data = server_socket.recv(4096)
-                if not data:
-                    break
-                response += data
-                client_socket.sendall(data)
-            except socket.error as e:
-                print(f"Error forwarding data to client: {e}")
+            data = server_socket.recv(4096)
+            if not data:
                 break
+            response += data
+            client_socket.sendall(data)
 
-        end_time = time.time()
-        duration = end_time - start_time
+        # Calculate duration and chunk size
+        duration = time.time() - start_time
+        chunk_size = get_chunk_size(response)
 
-        # Extract chunk size (excluding headers)
-        header_end = response.find(b'\r\n\r\n')
-        if header_end != -1:
-            body = response[header_end+4:]
-            chunk_size = len(body)
-        else:
-            chunk_size = len(response)
-
-        # Log the activity with the full chunk path
-        log_activity(log_file, duration, server_ip, chunk_path, chunk_size)
-
-        # Close sockets
-        server_socket.close()
-        client_socket.close()
+        # Log the chunk information
+        log_chunk(log_file, duration, server_ip, chunk_path, chunk_size)
 
     except Exception as e:
         print(f"Error handling client: {e}")
-        client_socket.close()
-
+    finally:
+        try:
+            client_socket.close()
+            server_socket.close()
+        except:
+            pass
 
 def start_proxy(log_file, listen_port, fake_ip, server_ip):
-    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    proxy_socket.bind(('', listen_port))  # Bind to all interfaces on the specified port
-    proxy_socket.listen(100)  # Listen for up to 100 connections
-    print(f"Proxy listening on port {listen_port}...")
+    """Start the proxy server"""
+    try:
+        # Create the proxy socket
+        proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        proxy_socket.bind(('', listen_port))  # Bind to all interfaces
+        proxy_socket.listen(100)  # Support up to 100 concurrent connections
+        
+        print(f"Proxy listening on port {listen_port}")
 
-    while True:
-        client_socket, addr = proxy_socket.accept()  # Unpack the client socket and address
-        print(f"Accepted connection from {addr}")  # Debug: Show client IP
-        client_thread = threading.Thread(target=handle_client, args=(client_socket, log_file, fake_ip, server_ip))
-        client_thread.start()
+        while True:
+            # Accept client connections
+            client_socket, client_addr = proxy_socket.accept()
+            print(f"New connection from {client_addr}")
+            
+            # Start new thread for each client
+            client_thread = threading.Thread(
+                target=handle_client,
+                args=(client_socket, log_file, fake_ip, server_ip)
+            )
+            client_thread.daemon = True
+            client_thread.start()
 
+    except Exception as e:
+        print(f"Proxy server error: {e}")
+    finally:
+        proxy_socket.close()
 
 if __name__ == "__main__":
     if len(sys.argv) != 5:
@@ -105,8 +126,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     log_file = sys.argv[1]
-    listen_port = int(sys.argv[2])  # Port should be an integer
-    fake_ip = sys.argv[3]  # IP addresses should remain as strings
-    server_ip = sys.argv[4]  # No need to convert the IP to int
-    
+    listen_port = int(sys.argv[2])
+    fake_ip = sys.argv[3]
+    server_ip = sys.argv[4]
+
     start_proxy(log_file, listen_port, fake_ip, server_ip)
